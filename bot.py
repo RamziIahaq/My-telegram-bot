@@ -7,34 +7,50 @@ import requests
 import telebot
 
 from dotenv import load_dotenv
-from google import genai
+import google.generativeai as genai  # التعديل الصحيح للاستدعاء الرسمي
 from telebot import apihelper
 
-# =========================================================
-# تحميل المفاتيح من ملف .env الذي قمنا بإنشائه
-# =========================================================
+# ==========================================
+# قراءة المفاتيح والتحقق من البيئة السحابية الآمنة
+# ==========================================
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# مطابقة المسميات مع لوحة تحكم موقع الاستضافة تماماً
+TELEGRAM_TOKEN = os.getenv("Telegram _Bot_Token")
+GEMINI_API_KEY = os.getenv("Gemini_API_Key")
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    print("❌ خطأ: لم يتم العثور على المفاتيح! تأكد من إعداد ملف .env بشكل صحيح.")
+    print("❌ خطأ: لم يتم العثور على المفاتيح السحابية! تأكد من إعدادها في الموقع.")
     sys.exit(1)
 
-# =========================================================
-# الإعدادات الأساسية
-# =========================================================
-# الموديل الصحيح المدعوم للصوتيات
-MODEL = "gemini-1.5-flash"
+# تفعيل وربط مفتاح الذكاء الاصطناعي مع المكتبة بنجاح
+genai.configure(api_key=GEMINI_API_KEY)
 
-MAX_RETRIES = 8
+# ==========================================
+# الإعدادات الأساسية
+# ==========================================
+MODEL = "gemini-3.8-flash"  # أو gemini-2.5-flash حسب دعم المكتبة المثبتة
+
+MAX_RETRIES = 5
 FILE_TIMEOUT = 300
 TELEGRAM_CHUNK = 3800
 BOT_THREADS = 4
 
 apihelper.CONNECT_TIMEOUT = 60
 apihelper.READ_TIMEOUT = 300
+
+# =========================================================
+# إنشاء العملاء
+# =========================================================
+bot = telebot.TeleBot(
+    TELEGRAM_TOKEN,
+    threaded=True,
+    num_threads=BOT_THREADS
+)
+
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 # =========================================================
 # إنشاء العملاء
