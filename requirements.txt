@@ -2,3 +2,4 @@ pyTelegramBotAPI
 google-genai
 requests
 python-dotenv
+Flask
