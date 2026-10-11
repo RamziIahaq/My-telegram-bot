@@ -4,570 +4,424 @@ import time
 import random
 import tempfile
 import threading
+from pathlib import Path
 
 import requests
 import telebot
+from telebot import types, apihelper
 from flask import Flask
 from dotenv import load_dotenv
 from google import genai
-from telebot import apihelper
-
 
 # =========================================================
-# 1. تحميل الإعدادات والمفاتيح السرية
+# إعدادات البيئة والأمان
 # =========================================================
-
-# تحميل ملف .env إن كان موجودًا في مجلد التشغيل الحالي.
-# في الاستضافة، يمكن تعريف المتغيرات من لوحة التحكم مباشرة.
 load_dotenv()
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+PORT = int(os.getenv("PORT", "8080"))
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "19"))
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+MAX_RETRIES = 3
+FILE_TIMEOUT = 300
+TELEGRAM_CHUNK = 3500
+BOT_THREADS = 4
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    print(
-        "خطأ: تأكد من ضبط TELEGRAM_BOT_TOKEN "
-        "وGEMINI_API_KEY في متغيرات البيئة."
-    )
+    print("خطأ: اضبط TELEGRAM_BOT_TOKEN و GEMINI_API_KEY في متغيرات البيئة.")
     sys.exit(1)
-
-
-# =========================================================
-# 2. الإعدادات الأساسية
-# =========================================================
-
-MODEL = "gemini-3.8-flash"
-
-MAX_RETRIES = 5
-FILE_TIMEOUT = 300
-TELEGRAM_CHUNK = 3800
-BOT_THREADS = 4
 
 apihelper.CONNECT_TIMEOUT = 60
 apihelper.READ_TIMEOUT = 300
-
-
-# =========================================================
-# 3. إنشاء العملاء
-# =========================================================
-
-bot = telebot.TeleBot(
-    TELEGRAM_TOKEN,
-    threaded=True,
-    num_threads=BOT_THREADS
-)
-
+bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=True, num_threads=BOT_THREADS)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# جلسات في الذاكرة؛ تُمسح عند إعادة تشغيل البرنامج.
+SESSIONS = {}
+SESSION_LOCK = threading.RLock()
 
-# =========================================================
-# 4. وظائف مساعدة
-# =========================================================
+LANGUAGES = {
+    "auto": "لغة المحتوى الأصلية",
+    "ar": "العربية",
+    "en": "English",
+    "fr": "Français",
+    "es": "Español",
+    "de": "Deutsch",
+    "tr": "Türkçe",
+    "ur": "اردو",
+    "id": "Bahasa Indonesia",
+    "hi": "हिन्दी",
+    "zh": "中文",
+    "ja": "日本語",
+    "pt": "Português",
+    "ru": "Русский",
+}
+
+TASKS = {
+    "quick": ("⚡ ملخص سريع", "لخّص المحتوى في نقاط موجزة، مع أهم الأفكار فقط."),
+    "detail": ("📚 ملخص تفصيلي", "أنشئ ملخصًا تفصيليًا منظمًا بالعناوين والنقاط، ولا تُسقط الأفكار المهمة."),
+    "quiz": ("📝 أسئلة اختبار", "أنشئ 10 أسئلة متنوعة من المحتوى (اختيار من متعدد وصح/خطأ وأسئلة قصيرة)، ثم ضع نموذج الإجابة في قسم منفصل في النهاية."),
+    "cards": ("🃏 بطاقات مذاكرة", "أنشئ بطاقات مراجعة؛ كل بطاقة تحتوي سؤالًا واضحًا ثم الإجابة تحته. استخرجها من المحتوى فقط."),
+    "explain": ("💡 شرح مبسّط", "اشرح المفاهيم الصعبة بلغة سهلة، مع أمثلة توضيحية. ميّز بين ما ورد في المحتوى وما هو مثال توضيحي منك."),
+    "qa": ("❓ سؤال وجواب", "حوّل أهم معلومات المحتوى إلى أسئلة وأجوبة مرتبة للمراجعة."),
+    "outline": ("📑 عناوين رئيسية", "رتّب المحتوى على شكل مخطط بعناوين رئيسية وفرعية ونقاط مرتبة."),
+    "terms": ("📖 مصطلحات وتعريفات", "استخرج المصطلحات المهمة وعرّفها بحسب المحتوى. اكتب «لم يرد تعريف واضح» عند عدم وجود تعريف كافٍ."),
+    "english": ("🌐 ملخص إنجليزي", "اكتب ملخصًا باللغة الإنجليزية للمحتوى، مع الحفاظ على المعنى والمصطلحات الأساسية."),
+    "mindmap": ("🧠 خريطة ذهنية نصية", "حوّل المحتوى إلى خريطة ذهنية نصية واضحة تبدأ بالموضوع الرئيسي ثم الفروع والأفكار المرتبطة."),
+}
+
 
 def safe_error(error):
-    """إخفاء المفاتيح السرية من رسائل الأخطاء."""
     text = str(error)
-
     for secret in (TELEGRAM_TOKEN, GEMINI_API_KEY):
         if secret:
             text = text.replace(secret, "[REDACTED]")
+    # لا نعرض تفاصيل داخلية طويلة للمستخدم
+    return text[:700]
 
-    return text
+
+def get_session(user_id):
+    with SESSION_LOCK:
+        return SESSIONS.setdefault(user_id, {"content": "", "language": "auto", "source": ""})
 
 
-def status(chat_id, message_id, text):
-    """تحديث رسالة حالة المعالجة."""
+def main_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(types.KeyboardButton("🏠 القائمة"), types.KeyboardButton("🌍 اللغة"))
+    keyboard.add(types.KeyboardButton("📖 كيف أستخدمه؟"), types.KeyboardButton("🧹 مسح المحتوى"))
+    return keyboard
+
+
+def task_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    buttons = [types.InlineKeyboardButton(label, callback_data=f"task:{key}") for key, (label, _) in TASKS.items()]
+    keyboard.add(*buttons)
+    keyboard.add(types.InlineKeyboardButton("🌍 تغيير لغة النتيجة", callback_data="menu:language"))
+    return keyboard
+
+
+def language_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    buttons = [types.InlineKeyboardButton(label, callback_data=f"lang:{key}") for key, label in LANGUAGES.items()]
+    keyboard.add(*buttons)
+    keyboard.add(types.InlineKeyboardButton("↩️ رجوع", callback_data="menu:home"))
+    return keyboard
+
+
+def split_text(text, limit=TELEGRAM_CHUNK):
+    text = (text or "").strip()
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit + 1)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit + 1)
+        if cut < limit // 2:
+            cut = limit
+        part = text[:cut].strip()
+        if part:
+            parts.append(part)
+        text = text[cut:].strip()
+    if text:
+        parts.append(text)
+    return parts
+
+
+def send_long_text(chat_id, text, prefix=""):
+    parts = split_text(text)
+    if not parts:
+        bot.send_message(chat_id, "لم يتم إنشاء نص صالح للإرسال.", reply_markup=main_keyboard())
+        return
+    for index, part in enumerate(parts, 1):
+        header = prefix
+        if len(parts) > 1:
+            header = f"{prefix}\n({index}/{len(parts)})" if prefix else f"({index}/{len(parts)})"
+        bot.send_message(chat_id, f"{header}\n\n{part}" if header else part, reply_markup=main_keyboard(), timeout=60)
+        time.sleep(0.15)
+
+
+def update_status(chat_id, message_id, text):
     try:
-        bot.edit_message_text(
-            text,
-            chat_id=chat_id,
-            message_id=message_id
-        )
-    except Exception:
-        pass
-
-
-def delete_message(chat_id, message_id):
-    """حذف رسالة الحالة."""
-    try:
-        bot.delete_message(
-            chat_id=chat_id,
-            message_id=message_id
-        )
+        bot.edit_message_text(text, chat_id, message_id)
     except Exception:
         pass
 
 
 def retryable(error):
-    """تحديد بعض الأخطاء التي قد تكون مؤقتة."""
-    text = safe_error(error).upper()
-
-    words = [
-        "408",
-        "425",
-        "429",
-        "500",
-        "502",
-        "503",
-        "504",
-        "RESOURCE_EXHAUSTED",
-        "UNAVAILABLE",
-        "OVERLOADED",
-        "DEADLINE_EXCEEDED",
-        "INTERNAL",
-        "TIMEOUT",
-        "TIMED OUT",
-        "CONNECTION RESET",
-        "CONNECTION ERROR",
-        "SERVICE UNAVAILABLE"
-    ]
-
-    return any(word in text for word in words)
+    value = safe_error(error).upper()
+    return any(term in value for term in ["408", "425", "429", "500", "502", "503", "504", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "OVERLOADED", "DEADLINE_EXCEEDED", "TIMEOUT", "TIMED OUT", "CONNECTION RESET", "CONNECTION ERROR"])
 
 
-def wait_time(attempt):
-    """حساب وقت الانتظار بين المحاولات."""
-    base = min(60, 5 * (2 ** (attempt - 1)))
-    return base + random.uniform(0, 2)
-
-
-# =========================================================
-# 5. انتظار تجهيز الملف في Gemini
-# =========================================================
-
-def wait_for_file(file):
-    start = time.monotonic()
-
-    while True:
-        if time.monotonic() - start > FILE_TIMEOUT:
-            raise TimeoutError(
-                "انتهت مهلة تجهيز الملف في Gemini."
-            )
-
-        current = client.files.get(name=file.name)
-
-        state = getattr(current, "state", None)
-        state_name = getattr(state, "name", str(state or ""))
-        state_name = state_name.upper().split(".")[-1]
-
-        if state_name == "ACTIVE":
-            return current
-
-        if state_name in {"FAILED", "CANCELLED"}:
-            raise RuntimeError(
-                f"تعذرت معالجة الملف في Gemini: {state_name}"
-            )
-
-        time.sleep(4)
-
-
-# =========================================================
-# 6. تفريغ التسجيل الصوتي
-# =========================================================
-
-def transcribe(file, chat_id, message_id):
-
-    prompt = """
-قم بتفريغ جميع الكلمات المسموعة في التسجيل الصوتي إلى نص كامل.
-
-التعليمات:
-1. لا تلخص التسجيل.
-2. لا تحذف أي كلام مسموع.
-3. حافظ على ترتيب الكلام.
-4. استخدم لغة المتحدث الأصلية.
-5. لا تضف معلومات من عندك.
-6. إذا كان هناك أكثر من متحدث، فحاول فصل كلامهم.
-7. لا تكتب مقدمة أو شرحًا خارج النص المفرغ.
-8. أعد النص المفرغ كاملًا فقط، دون تلخيص أو استخراج نقاط.
-9. استخدم علامات الترقيم والفقرات المناسبة عندما يكون ذلك ممكنًا.
-""".strip()
-
+def generate_text(prompt, contents=None):
+    last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            status(
-                chat_id,
-                message_id,
-                "✍️ جارٍ تفريغ التسجيل الصوتي...\n"
-                f"المحاولة {attempt}/{MAX_RETRIES}"
-            )
-
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=[prompt, file]
-            )
-
-            text = getattr(response, "text", None)
-
-            if text and text.strip():
-                return text.strip()
-
-            raise RuntimeError(
-                "لم يرجع Gemini نصًا من التسجيل."
-            )
-
+            payload = [prompt] if contents is None else [prompt, contents]
+            response = client.models.generate_content(model=MODEL, contents=payload)
+            result = getattr(response, "text", None)
+            if result and result.strip():
+                return result.strip()
+            raise RuntimeError("لم يرجع النموذج نصًا.")
         except Exception as exc:
-            print(
-                f"[Gemini Error] {safe_error(exc)}"
-            )
-
-            if not retryable(exc):
-                raise
-
-            if attempt >= MAX_RETRIES:
-                raise RuntimeError(
-                    "تعذر التفريغ بعد عدة محاولات."
-                ) from exc
-
-            delay = wait_time(attempt)
-
-            status(
-                chat_id,
-                message_id,
-                "⏳ الخدمة مشغولة مؤقتًا.\n"
-                f"ستتم إعادة المحاولة بعد {delay:.0f} ثانية."
-            )
-
-            time.sleep(delay)
-
-    raise RuntimeError("فشل تفريغ التسجيل.")
+            last_error = exc
+            if attempt >= MAX_RETRIES or not retryable(exc):
+                break
+            time.sleep(min(20, 2 ** attempt) + random.uniform(0, 1))
+    raise RuntimeError(f"تعذرت معالجة الطلب: {safe_error(last_error)}") from last_error
 
 
-# =========================================================
-# 7. تقسيم النص الطويل مع المحافظة على الفقرات
-# =========================================================
-
-def split_text(text):
-    text = text.strip()
-
-    if not text:
-        return []
-
-    result = []
-
-    while len(text) > TELEGRAM_CHUNK:
-
-        # محاولة التقسيم عند نهاية سطر أولًا.
-        split_at = text.rfind(
-            "\n",
-            0,
-            TELEGRAM_CHUNK + 1
-        )
-
-        # إذا كان السطر بعيدًا جدًا، نحاول التقسيم عند مسافة.
-        if split_at < TELEGRAM_CHUNK // 2:
-            split_at = text.rfind(
-                " ",
-                0,
-                TELEGRAM_CHUNK + 1
-            )
-
-        # إذا لم نجد موضعًا مناسبًا، نستخدم حد الأحرف.
-        if split_at < TELEGRAM_CHUNK // 2:
-            split_at = TELEGRAM_CHUNK
-
-        part = text[:split_at].strip()
-
-        if part:
-            result.append(part)
-
-        text = text[split_at:].strip()
-
-    if text:
-        result.append(text)
-
-    return result
+def wait_for_file(uploaded):
+    start = time.monotonic()
+    while time.monotonic() - start < FILE_TIMEOUT:
+        current = client.files.get(name=uploaded.name)
+        state = getattr(current, "state", None)
+        state_name = getattr(state, "name", str(state or "")).upper().split(".")[-1]
+        if state_name in ("ACTIVE", "SUCCEEDED"):
+            return current
+        if state_name in ("FAILED", "CANCELLED"):
+            raise RuntimeError(f"فشل تجهيز الملف لدى Gemini ({state_name}).")
+        time.sleep(3)
+    raise TimeoutError("استغرق تجهيز الملف وقتًا أطول من المتوقع.")
 
 
-def send_text(chat_id, text):
-    parts = split_text(text)
-
-    if not parts:
-        raise RuntimeError("النص المفرغ فارغ.")
-
-    total = len(parts)
-
-    for number, part in enumerate(parts, start=1):
-
-        if total == 1:
-            message = "📝 النص المفرغ:\n\n" + part
-        else:
-            message = (
-                f"📝 النص المفرغ ({number}/{total})\n\n"
-                + part
-            )
-
-        bot.send_message(
-            chat_id,
-            message,
-            timeout=60
-        )
-
-        time.sleep(0.3)
-
-
-# =========================================================
-# 8. تنزيل الملف الصوتي من Telegram
-# =========================================================
-
-def download_file(file_id, path):
+def download_telegram_file(file_id, destination):
     telegram_file = bot.get_file(file_id)
-
-    url = (
-        "https://api.telegram.org/file/bot"
-        f"{TELEGRAM_TOKEN}/{telegram_file.file_path}"
-    )
-
+    file_path = getattr(telegram_file, "file_path", None)
+    if not file_path:
+        raise RuntimeError("تعذر الحصول على مسار الملف من Telegram.")
+    url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
     try:
-        with requests.get(
-            url,
-            timeout=(30, 300),
-            stream=True
-        ) as response:
-
+        with requests.get(url, timeout=(30, 240), stream=True) as response:
             response.raise_for_status()
-
-            with open(path, "wb") as output:
-                for chunk in response.iter_content(
-                    chunk_size=1024 * 1024
-                ):
-                    if chunk:
-                        output.write(chunk)
-
-    except requests.RequestException as exc:
-        # لا نطبع عنوان الطلب الذي يحتوي على توكن البوت.
-        raise RuntimeError(
-            "فشل تنزيل الملف من Telegram. "
-            "تحقق من الاتصال وحجم الملف."
-        ) from None
+            total = 0
+            with open(destination, "wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 512):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_FILE_BYTES:
+                        raise RuntimeError(f"حجم الملف أكبر من الحد الحالي ({MAX_FILE_MB} MB).")
+                    output.write(chunk)
+    except requests.RequestException:
+        raise RuntimeError("فشل تنزيل الملف من Telegram. تحقق من الاتصال وحجم الملف.") from None
 
 
-# =========================================================
-# 9. معالجة التسجيل كاملًا
-# =========================================================
+def detect_media(message):
+    if message.content_type == "voice":
+        return message.voice.file_id, ".ogg", "audio"
+    if message.content_type == "audio":
+        name = message.audio.file_name or "audio.mp3"
+        ext = Path(name).suffix.lower()
+        if not ext or len(ext) > 10 or not ext[1:].isalnum():
+            ext = ".audio"
+        return message.audio.file_id, ext, "audio"
+    if message.content_type == "document":
+        doc = message.document
+        name = doc.file_name or ""
+        mime = (doc.mime_type or "").lower()
+        if mime == "application/pdf" or name.lower().endswith(".pdf"):
+            return doc.file_id, ".pdf", "pdf"
+    return None
 
-def process_audio(message):
+
+def process_media(message):
     chat_id = message.chat.id
-
-    waiting = None
+    user_id = message.from_user.id
+    waiting = bot.reply_to(message, "⏳ استلمت الملف، جارٍ التجهيز...", reply_markup=main_keyboard())
+    local_path = None
     uploaded = None
-    temp_file = None
-
     try:
-        waiting = bot.reply_to(
-            message,
-            "⏳ جارٍ استلام التسجيل الصوتي..."
-        )
-
-        if message.content_type == "voice":
-            file_id = message.voice.file_id
-            extension = ".ogg"
-
-        elif message.content_type == "audio":
-            file_id = message.audio.file_id
-
-            filename = (
-                message.audio.file_name or "audio.mp3"
-            )
-
-            extension = (
-                os.path.splitext(filename)[1] or ".mp3"
-            )
-
-            # منع امتداد غير مناسب كاسم لملف مؤقت.
-            if (
-                not extension.startswith(".")
-                or len(extension) > 16
-                or not extension[1:].isalnum()
-            ):
-                extension = ".audio"
-
-        else:
-            raise RuntimeError(
-                "نوع الملف غير مدعوم."
-            )
-
-        fd, temp_file = tempfile.mkstemp(
-            prefix="audio_",
-            suffix=extension
-        )
-
+        media = detect_media(message)
+        if not media:
+            bot.send_message(chat_id, "أستطيع حاليًا معالجة التسجيلات الصوتية وملفات PDF. أرسل ملف PDF أو صوتًا.", reply_markup=main_keyboard())
+            return
+        file_id, extension, media_kind = media
+        fd, local_path = tempfile.mkstemp(prefix="studybot_", suffix=extension)
         os.close(fd)
-
-        status(
-            chat_id,
-            waiting.message_id,
-            "⬇️ جارٍ تنزيل التسجيل..."
-        )
-
-        download_file(file_id, temp_file)
-
-        size = os.path.getsize(temp_file)
-
-        if size <= 0:
-            raise RuntimeError(
-                "الملف الصوتي فارغ."
-            )
-
-        status(
-            chat_id,
-            waiting.message_id,
-            "☁️ جارٍ رفع التسجيل إلى Gemini..."
-        )
-
-        uploaded = client.files.upload(
-            file=temp_file
-        )
-
+        update_status(chat_id, waiting.message_id, "⬇️ جارٍ تنزيل الملف...")
+        download_telegram_file(file_id, local_path)
+        if os.path.getsize(local_path) == 0:
+            raise RuntimeError("الملف فارغ.")
+        update_status(chat_id, waiting.message_id, "☁️ جارٍ إرسال الملف إلى خدمة الذكاء الاصطناعي...")
+        uploaded = client.files.upload(file=local_path)
         active_file = wait_for_file(uploaded)
-
-        text = transcribe(
-            active_file,
-            chat_id,
-            waiting.message_id
-        )
-
-        if not text:
-            raise RuntimeError(
-                "لم يتم استخراج نص من التسجيل."
-            )
-
-        delete_message(
-            chat_id,
-            waiting.message_id
-        )
-
-        send_text(chat_id, text)
-
-    except Exception as exc:
-        error = safe_error(exc)
-
-        # تسجيل الخطأ دون كشف المفاتيح السرية.
-        print(
-            f"[Processing Error] {error}"
-        )
-
-        if len(error) > 500:
-            error = error[:500] + "..."
-
-        if waiting:
-            status(
-                chat_id,
-                waiting.message_id,
-                "❌ حدث خطأ أثناء المعالجة:\n\n" + error
-            )
+        if media_kind == "audio":
+            prompt = """فرّغ التسجيل الصوتي إلى نص كامل قدر الإمكان.
+التعليمات: لا تلخص ولا تحذف الكلام المسموع، حافظ على لغة المتحدث الأصلية وترتيب الأفكار، استخدم علامات ترقيم وفقرات مناسبة، وافصل المتحدثين إذا أمكن. لا تخترع كلمات غير مسموعة؛ ضع [غير واضح] عند تعذر الفهم. أخرج النص المفرغ فقط."""
+            source_name = "تسجيل صوتي"
         else:
-            try:
-                bot.send_message(
-                    chat_id,
-                    "❌ حدث خطأ أثناء معالجة التسجيل."
-                )
-            except Exception:
-                pass
-
+            prompt = """استخرج النص والمعلومات الدراسية من ملف PDF بدقة وبالترتيب. حافظ على العناوين والنقاط والمعادلات بقدر الإمكان. إذا كان الملف ممسوحًا ضوئيًا فحاول قراءة النص الظاهر. لا تلخص المحتوى في هذه الخطوة ولا تخترع أجزاء غير واضحة؛ أشر إلى مواضع النص غير المقروء عند الحاجة. أخرج النص المستخرج فقط."""
+            source_name = "ملف PDF"
+        update_status(chat_id, waiting.message_id, "🧠 جارٍ قراءة المحتوى وتجهيزه للمذاكرة...")
+        content = generate_text(prompt, active_file)
+        if len(content.strip()) < 5:
+            raise RuntimeError("لم أتمكن من استخراج نص كافٍ من الملف.")
+        with SESSION_LOCK:
+            SESSIONS[user_id] = {"content": content, "language": get_session(user_id).get("language", "auto"), "source": source_name}
+        try:
+            bot.delete_message(chat_id, waiting.message_id)
+        except Exception:
+            pass
+        # أرسل النص المستخرج ثم خيارات الدراسة
+        send_long_text(chat_id, content, prefix=f"📝 النص المستخرج من {source_name}")
+        bot.send_message(chat_id, "✅ جهّزت المحتوى! اختر كيف تبي تذاكره:", reply_markup=task_keyboard())
+    except Exception as exc:
+        print(f"[Media Error] {safe_error(exc)}")
+        update_status(chat_id, waiting.message_id, "❌ ما قدرت أعالج الملف.\n\n" + safe_error(exc))
     finally:
-        # حذف الملف البعيد من Gemini إن أمكن.
         if uploaded:
             try:
-                client.files.delete(
-                    name=uploaded.name
-                )
+                client.files.delete(name=uploaded.name)
             except Exception as exc:
-                print(
-                    "[Cleanup Warning] تعذر حذف ملف Gemini: "
-                    f"{type(exc).__name__}"
-                )
-
-        # حذف الملف المحلي المؤقت.
-        if temp_file and os.path.exists(temp_file):
+                print(f"[Cleanup] تعذر حذف الملف البعيد: {type(exc).__name__}")
+        if local_path and os.path.exists(local_path):
             try:
-                os.remove(temp_file)
-            except OSError as exc:
-                print(
-                    "[Cleanup Warning] تعذر حذف الملف المحلي: "
-                    f"{type(exc).__name__}"
-                )
+                os.remove(local_path)
+            except OSError:
+                pass
+
+
+def language_instruction(language_code):
+    if language_code == "auto":
+        return "اكتب النتيجة بلغة المحتوى الأصلية."
+    language = LANGUAGES.get(language_code, "العربية")
+    return f"اكتب النتيجة باللغة التالية فقط: {language}. حافظ على المعنى والمصطلحات المهمة."
+
+
+def run_task(call, task_key):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    task = TASKS.get(task_key)
+    with SESSION_LOCK:
+        session = SESSIONS.get(user_id, {}).copy()
+    content = session.get("content", "").strip()
+    if not content:
+        bot.answer_callback_query(call.id, "أرسل تسجيلًا أو PDF أو نصًا أولًا.", show_alert=True)
+        return
+    if not task:
+        bot.answer_callback_query(call.id, "الخيار غير معروف.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, "بدأت المعالجة...")
+    wait = bot.send_message(chat_id, f"⏳ جارٍ إعداد: {task[0]}...")
+    prompt = f"""أنت مساعد دراسة دقيق. استخدم المحتوى الذي يرسله المستخدم أساسًا للإجابة، ولا تضف حقائق على أنها من المصدر إذا لم ترد فيه. إذا كان المحتوى ناقصًا أو غير واضح فاذكر ذلك بصراحة.
+المهمة: {task[1]}
+{language_instruction(session.get('language', 'auto'))}
+استخدم تنسيقًا واضحًا وعناوين مناسبة. لا تذكر أنك نموذج ذكاء اصطناعي، ولا تكرر الطلب.
+
+المحتوى:
+---
+{content}
+---"""
+    try:
+        result = generate_text(prompt)
+        try:
+            bot.delete_message(chat_id, wait.message_id)
+        except Exception:
+            pass
+        send_long_text(chat_id, result, prefix=task[0])
+        bot.send_message(chat_id, "تقدر تختار طريقة ثانية لنفس المحتوى من الأزرار:", reply_markup=task_keyboard())
+    except Exception as exc:
+        update_status(chat_id, wait.message_id, "❌ تعذرت معالجة الطلب.\n\n" + safe_error(exc))
 
 
 # =========================================================
-# 10. أوامر Telegram
+# أوامر Telegram والأزرار
 # =========================================================
-
 @bot.message_handler(commands=["start", "help"])
 def start(message):
-    bot.reply_to(
-        message,
-        "🤖 أهلًا بك!\n\n"
-        "🎙️ أرسل لي تسجيلًا صوتيًا أو ملفًا صوتيًا.\n"
-        "وسأعمل على تفريغه إلى نص كامل.\n\n"
-        "ملاحظة: يعتمد التفريغ على وضوح الصوت وجودته."
+    text = (
+        "🤖 أهلًا بك في مساعد الدراسة الذكي!\n\n"
+        "أرسل لي أحد الأشياء التالية:\n"
+        "🎙️ تسجيلًا صوتيًا أو ملفًا صوتيًا\n"
+        "📄 ملف PDF\n"
+        "📝 أو الصق نص الدرس مباشرة\n\n"
+        "بعد قراءة المحتوى، تقدر تختار ملخصًا أو أسئلة اختبار أو بطاقات مذاكرة أو شرحًا مبسطًا.\n\n"
+        "🌍 تقدر تغيّر لغة النتائج من زر اللغة."
     )
+    bot.send_message(message.chat.id, text, reply_markup=main_keyboard())
 
 
-@bot.message_handler(
-    content_types=["audio", "voice"]
-)
-def audio(message):
-    process_audio(message)
+@bot.message_handler(commands=["cancel"])
+def cancel(message):
+    bot.send_message(message.chat.id, "تم. إذا تبي تبدأ من جديد أرسل نصًا أو ملفًا آخر.", reply_markup=main_keyboard())
 
 
-@bot.message_handler(
-    func=lambda message: True
-)
-def other(message):
-    bot.reply_to(
-        message,
-        "🎙️ أرسل تسجيلًا صوتيًا حتى أقوم بتفريغه."
-    )
+@bot.callback_query_handler(func=lambda call: call.data.startswith("task:"))
+def task_callback(call):
+    run_task(call, call.data.split(":", 1)[1])
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu:language")
+def language_menu_callback(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "اختر لغة النتائج:", reply_markup=language_keyboard())
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("lang:"))
+def language_callback(call):
+    code = call.data.split(":", 1)[1]
+    if code not in LANGUAGES:
+        bot.answer_callback_query(call.id, "اللغة غير مدعومة.", show_alert=True)
+        return
+    with SESSION_LOCK:
+        session = get_session(call.from_user.id)
+        session["language"] = code
+    bot.answer_callback_query(call.id, "تم حفظ اللغة.")
+    bot.send_message(call.message.chat.id, f"✅ لغة النتائج: {LANGUAGES[code]}", reply_markup=main_keyboard())
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu:home")
+def home_callback(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "أرسل صوتًا أو PDF أو نصًا، ثم اختر طريقة المذاكرة.", reply_markup=main_keyboard())
+
+
+@bot.message_handler(content_types=["voice", "audio", "document"])
+def media_handler(message):
+    process_media(message)
+
+
+@bot.message_handler(content_types=["text"])
+def text_handler(message):
+    text = (message.text or "").strip()
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    if text == "🏠 القائمة":
+        bot.send_message(chat_id, "🏠 القائمة الرئيسية\nأرسل تسجيلًا صوتيًا أو PDF أو الصق نص الدرس.", reply_markup=main_keyboard())
+        return
+    if text == "🌍 اللغة":
+        bot.send_message(chat_id, "اختر لغة النتائج التي تريدها:", reply_markup=language_keyboard())
+        return
+    if text == "📖 كيف أستخدمه؟":
+        bot.send_message(chat_id, "1) أرسل تسجيلًا صوتيًا أو PDF أو نصًا.\n2) انتظر تجهيز المحتوى.\n3) اختر إحدى أدوات الدراسة.\n4) تستطيع إعادة استخدام المحتوى واختيار أداة أخرى.\n\nملاحظة: الجلسة تحفظ المحتوى في ذاكرة البرنامج مؤقتًا، وتُمسح عند إعادة تشغيله.", reply_markup=main_keyboard())
+        return
+    if text == "🧹 مسح المحتوى":
+        with SESSION_LOCK:
+            SESSIONS[user_id] = {"content": "", "language": get_session(user_id).get("language", "auto"), "source": ""}
+        bot.send_message(chat_id, "🧹 تم مسح المحتوى المحفوظ لهذه الجلسة.", reply_markup=main_keyboard())
+        return
+    if text.startswith("/"):
+        return
+    if len(text) < 3:
+        bot.reply_to(message, "أرسل نصًا أطول قليلًا أو ملفًا صوتيًا أو PDF.", reply_markup=main_keyboard())
+        return
+    if len(text) > 50000:
+        bot.reply_to(message, "النص طويل جدًا لرسالة واحدة. أرسل جزءًا أقصر أو ملف PDF.", reply_markup=main_keyboard())
+        return
+    with SESSION_LOCK:
+        old_language = get_session(user_id).get("language", "auto")
+        SESSIONS[user_id] = {"content": text, "language": old_language, "source": "نص مرسل"}
+    bot.send_message(chat_id, "✅ حفظت النص. اختر كيف تبي تذاكره:", reply_markup=task_keyboard())
 
 
 # =========================================================
-# 11. تشغيل البوت وإعادة الاتصال
+# خادم صحة للاستضافة
 # =========================================================
-
-def run():
-    print("=" * 55)
-    print("BOT STARTING")
-    print(f"Model: {MODEL}")
-    print(f"Workers: {BOT_THREADS}")
-    print("تم تحميل إعدادات البيئة.")
-    print("البوت جاهز لاستقبال التسجيلات بعد الاتصال.")
-    print("=" * 55)
-
-    while True:
-        try:
-            bot.infinity_polling(
-                timeout=60,
-                long_polling_timeout=20
-            )
-
-        except KeyboardInterrupt:
-            print("تم طلب إيقاف البوت.")
-            break
-
-        except Exception as exc:
-            print(
-                "[Telegram Error] "
-                f"{safe_error(exc)}"
-            )
-
-            print(
-                "ستتم محاولة إعادة الاتصال بعد 5 ثوانٍ."
-            )
-
-            time.sleep(5)
-
-
-# =========================================================
-# 12. خادم Flask للاستضافة
-# =========================================================
-
 app = Flask(__name__)
-
 
 @app.route("/")
 def home():
-    return "I am alive!", 200
-
+    return "Study bot is alive", 200
 
 @app.route("/health")
 def health():
@@ -575,30 +429,30 @@ def health():
 
 
 def run_flask():
-    port = int(
-        os.environ.get("PORT", "8080")
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False
-    )
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 
 def keep_alive():
-    thread = threading.Thread(
-        target=run_flask,
-        daemon=True
-    )
-
-    thread.start()
+    threading.Thread(target=run_flask, daemon=True).start()
 
 
-# =========================================================
-# 13. نقطة التشغيل النهائية
-# =========================================================
+def run():
+    print("=" * 55)
+    print("Study bot starting")
+    print(f"Gemini model: {MODEL}")
+    print(f"Max file size: {MAX_FILE_MB} MB")
+    print("Ready to receive audio, PDF, and text.")
+    print("=" * 55)
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=20, skip_pending=False)
+        except KeyboardInterrupt:
+            print("Bot stopped by user.")
+            break
+        except Exception as exc:
+            print(f"[Telegram Error] {safe_error(exc)}")
+            time.sleep(5)
+
 
 if __name__ == "__main__":
     keep_alive()
